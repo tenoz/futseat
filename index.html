@@ -763,7 +763,13 @@ textarea.inp{height:auto;padding:8px 10px;resize:vertical;line-height:1.5}
   transform-box:fill-box;transform-origin:50% 50%;
   transition:transform .22s cubic-bezier(.34,1.56,.64,1);
 }
-#stSvg .st-lb.hot{transform:scale(1.18)}
+/* 悬停阴影走 CSS 变量，不靠重绘：尺寸是屏幕像素、要 /k 抵消 svg 的 scale，由 drawStations
+   把算好的 --sh-y / --sh-b 写在 svg 上；颜色逐标签不同，由 stationGroup 写在每个 g 的 --sc 上。
+   ⚠️ 别改回在 stationGroup 里按 hov 输出 inline filter——悬停不重绘，写进去也不会生效 */
+#stSvg .st-lb.hot{
+  transform:scale(1.18);
+  filter:drop-shadow(0 calc(var(--sh-y,0) * 1px) calc(var(--sh-b,0) * 1px) var(--sc,rgba(0,0,0,.45)));
+}
 /* 椅子本体跟着悬停变亮：填色/透明度走 CSS 变量，悬停只切 hot 类，不重绘（同上，重绘就没过渡了） */
 #stSvg .st-ch{transition:opacity .16s ease}
 #stSvg .st-ch .st-seat{transition:fill .16s ease}
@@ -1043,8 +1049,9 @@ function ellipseText(t, n) { return t.length > n ? t.slice(0, n) + '…' : t; }
 
 /* ---------- 数据 ---------- */
 /* 存储层：二期走 localStorage + IndexedDB；三期换 HTTP 实现时只改 Store 内部，业务代码不动。
-   key 由 owner 派生，二期 owner 恒为 'guest'；三期换成真实 uid 只改 OWNER 的来源。 */
-const OWNER = 'guest';
+   key 由 owner 派生，二期 owner 恒为 'guest'；三期换成真实 uid 只改 OWNER 的来源。
+   demo 模式会把它换成 'demo'，数据落在独立 key 里——演示数据永远碰不到用户的真实库。 */
+let OWNER = 'guest';
 const NS = 'wf.futseat.v3';
 const LEGACY_KEY = 'wf.office.v2';
 const dbKey = (o = OWNER) => `${NS}.${o}`;
@@ -1071,7 +1078,7 @@ const COPY = {
 };
 
 /* 关于页的对外口径：版本号和仓库地址只在这里改一处 */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.2';
 const GITHUB_URL = 'https://github.com/tenoz/futseat';
 
 /* IndexedDB：参考图本体（替代 base64 塞 localStorage） */
@@ -1402,7 +1409,7 @@ async function loadDB() {
   try { raw = await Store.load(); }
   catch (e) { U.dbBroken = true; }
 
-  if (!raw) {
+  if (!raw && OWNER === 'guest') {         /* demo 库不迁 v2：别把真实数据搬进演示库 */
     raw = await migrateV2();
     if (raw) {
       normDB(raw);
@@ -1876,13 +1883,14 @@ let saveTimer = null;
 /* 保存机制：
    改动 → 220ms 防抖写草稿（真崩了能捞回来），但**不写正式数据**；
    只有 commitSave() 才把当前数据提升为正式、清掉草稿。
-   用户看到的"未保存"是真的没落正式，不是假象。 */
+   状态文案始终显示「已保存 HH:MM」——改过只把前面那个点变红，不退回「未保存」：
+   时间点是用户唯一能对照的锚，一改就消失反而看不出上次落正式是什么时候。 */
 function fmtClock(ts) {
   const d = new Date(ts);
   return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
 }
 function saveInfoText() {
-  return U.dirty ? '未保存' : (D.savedAt ? '已保存 ' + fmtClock(D.savedAt) : '还没保存过');
+  return D.savedAt ? '已保存 ' + fmtClock(D.savedAt) : '还没保存过';
 }
 /* 保存控件拆两块：左边纯文字状态，右边手动保存按钮。只有编辑页才放。 */
 function saveInfoHTML() {
@@ -2001,6 +2009,13 @@ function lighten(hex, amt) {
   if (n.length !== 6) return hex;
   const mix = v => Math.round(v + (255 - v) * amt).toString(16).padStart(2, '0');
   return '#' + mix(parseInt(n.slice(0, 2), 16)) + mix(parseInt(n.slice(2, 4), 16)) + mix(parseInt(n.slice(4, 6), 16));
+}
+/* hex → rgba：工位点阴影要用部门色，得能带透明度 */
+function hexA(hex, a) {
+  const h = String(hex || '').replace('#', '');
+  const n = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+  if (n.length !== 6) return `rgba(0,0,0,${a})`;
+  return `rgba(${parseInt(n.slice(0, 2), 16)},${parseInt(n.slice(2, 4), 16)},${parseInt(n.slice(4, 6), 16)},${a})`;
 }
 function deptColor(id) {
   let cur = deptById(id), guard = 0;
@@ -2282,11 +2297,13 @@ function openAbout() {
 
 /* ---------- 启动 ---------- */
 async function boot() {
+  const demo = demoOn();                  /* ?demo=1：演示入口，走独立存储库 */
+  if (demo) OWNER = 'demo';
   const shared = await tryEnterShare();   /* 分享链接：只装载链接里的数据，不读本机库、不写库 */
   if (!shared) {
     await loadDB();
     booted = true;        /* 加载完成才开始允许写库 */
-    if (FileLink.supported) await FileLink.restore();   /* 恢复绑定的本地文件（要在第一次保存之前） */
+    if (FileLink.supported && !demo) await FileLink.restore();   /* 演示不挂真实存档文件，免得保存时写进用户的 .json */
     await preloadRefs();
   }
   paintIcons();
@@ -2376,6 +2393,16 @@ async function boot() {
   go('stations');
   if (U.dbBroken) toast('本地数据读取失败，原文已备份到浏览器存储的 broken 副本，没有被覆盖', 6000);
   window.addEventListener('resize', onResize);
+  /* 演示入口：装好示例直接进工位排座，不弹引导、不恢复草稿（评委会被引导挡在门外） */
+  if (demo) {
+    const fresh = seedDemo();          /* 空库才装；已有数据就只管把镜头停在排座页 */
+    U.stMode = 'edit';
+    goNow('stations');
+    const lay = activeL();
+    if (fresh || (lay && lay.name === '示例办公室')) requestAnimationFrame(demoView);
+    if (fresh) setTimeout(() => toast('这是示例办公室，点任意一个工位就能改编号、换人', 4600), 500);
+    return;
+  }
   /* 只读预览到此为止：不自动保存、不挂 beforeunload、不恢复草稿、不弹引导 */
   if (shared) return;
   startAutoSave();
@@ -3312,6 +3339,10 @@ function planGroup(l, k, o = {}) {
 }
 
 /* ---------- 工位点 ---------- */
+/* 工位点阴影参数，单位是屏幕像素（站远 2px / 模糊 9px / 透明度 .5），颜色取部门色。
+   选中态和悬停态必须用同一套，所以提到模块级——stationGroup 用它算 inline，
+   drawStations 用它写 svg 的 --sh-y / --sh-b。改这里两处一起变。 */
+const ST_SH_Y = 2, ST_SH_B = 9, ST_SH_A = .5;
 /* 估算胶囊宽度（px）：中文按 1em、西文数字按 0.62em，左右各留 11px padding */
 function pillW(label, fs) {
   let w = 0;
@@ -3324,7 +3355,9 @@ function stationMode(k) { return k >= K_BASE * .6 ? 'pill' : 'round'; }
 function stationGroup(l, k, o = {}) {
   const mode = o.mode || stationMode(k);
   const out = [];
-  const shadowOf = s => `filter:drop-shadow(0 ${(s ? 3.2 : 1.6) / k}px ${(s ? 15 : 6) / k}px rgba(0,0,0,${s ? .58 : .34}))`;
+  /* 工位点阴影：尺寸是屏幕像素，要 /k 抵消 svg 的 scale；颜色取员工部门色。
+     选中态在这里直接算 inline，悬停态由 drawStations 写进 svg 的 --sh-y/--sh-b（见样式表） */
+  const shadowOf = color => `filter:drop-shadow(0 ${ST_SH_Y / k}px ${ST_SH_B / k}px ${color})`;
   const mono = !!o.print;              // 导出/打印：黑白版（白底黑框黑字）
   const pz = o.print ? 1.22 : 1;       // 导出时工位点整体放大，避免打印出来看不清
   const R = .23, TH = .085;
@@ -3399,11 +3432,15 @@ function stationGroup(l, k, o = {}) {
     const { st, emp, x, y, hot: hov } = it;
     const acc = mono ? C_INK : deptColor(emp.deptId);
     const sel = !!(o.sel && st.id === o.sel);
-    /* 悬停用「选中档」的阴影：标签同时被放大，阴影跟上才有浮起来的感觉 */
-    const sh = mono ? '' : shadowOf(sel || hov);
+    /* 阴影只在选中/悬停时出现：153 个标签各带一个 drop-shadow，每次平移/缩放都要逐个离屏
+       栅格化（实测占平移渲染耗时 24%：RasterTask 52→36ms、Layerize 38→21ms）。
+       选中态在重绘时写 inline；悬停态不重绘，所以颜色走 --sc、尺寸走 svg 上的 --sh-y/--sh-b */
+    const sc = mono ? `rgba(0,0,0,${ST_SH_A})` : hexA(acc, ST_SH_A);
+    const sh = mono || !sel ? '' : shadowOf(sc);
     const cls = ' class="st-lb' + (hov ? ' hot' : '') + '"';
-    const hit = o.interactive ? `data-hit="station" data-id="${st.id}"${cls} style="cursor:pointer;${sh}"`
-      : `${cls}${sh ? ` style="${sh}"` : ''}`;
+    const stl = `--sc:${sc}${sh ? ';' + sh : ''}`;
+    const hit = o.interactive ? `data-hit="station" data-id="${st.id}"${cls} style="cursor:pointer;${stl}"`
+      : `${cls} style="${stl}"`;
     const bg = mono ? C_WHITE : C_INK;
     if (mode === 'round') {
       const r = (sel ? 18.5 : 14) * pz / k;
@@ -3853,7 +3890,7 @@ function onResize() {
   if (U.view === 'office' && U.officeMode === 'edit') drawEditor();
   else if (U.view === 'stations') drawStations();
 }
-function zoomAt(cx, cy, factor) {
+function zoomAt(cx, cy, factor, preview) {
   /* 拖动 / 放置构件的过程中一律不缩放：k 是世界坐标的换算尺，
      手上正拖的对象下一帧就会按新 k 重算尺寸，表现就是「突然缩放」 */
   if (drag || U.ghost) return;
@@ -3864,17 +3901,48 @@ function zoomAt(cx, cy, factor) {
   U.px = nx - (nx - U.px) * (k2 / U.k);
   U.py = ny - (ny - U.py) * (k2 / U.k);
   U.k = k2;
+  /* preview：滚轮连续缩放中，不重建 DOM，只改外层 transform——标签留在画布上跟着整张图一起缩放，
+     手一停 zoomSettle() 再精绘回标准屏幕字号（见 §滚动缩放预览）。重建一次要 13 ms，
+     把这个钱花在每一帧上就是掉帧的根源 */
+  if (preview) {
+    paintPan();
+    if (typeof positionPop === 'function') positionPop();
+    syncZoomLabel();
+    return;
+  }
   if (U.view === 'office') drawEditor(); else drawStations();
   if (typeof positionPop === 'function') positionPop();
   syncZoomLabel();
 }
+/* 滚轮合帧：一帧最多缩放一次。触控板一秒能发上百个 wheel，逐个直接重绘等于一秒重画上百遍。
+   合帧不损失精度——指数相乘等于指数相加，累加 deltaY 再算一次和逐个应用完全等价 */
+let zRaf = 0, zAcc = 0, zX = 0, zY = 0, zSettle = 0;
 function onWheel(e) {
   e.preventDefault();
   /* 按住鼠标拖东西时，滚轮（触控板两指、鼠标滚轮误触）会把视图缩放掉，
      正在拖的对象尺寸跟着突变；拖动期间只吞掉事件，不缩放 */
   if (drag || U.ghost) return;
   if (!e.deltaY) return;
-  zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0022));
+  zAcc += e.deltaY; zX = e.clientX; zY = e.clientY;
+  if (zRaf) return;
+  zRaf = requestAnimationFrame(() => {
+    zRaf = 0;
+    const dy = zAcc; zAcc = 0;
+    if (!dy) return;
+    tipHide();                     /* 标签跟着整张图缩放，悬停卡片会指空，先收掉 */
+    zoomAt(zX, zY, Math.exp(-dy * 0.0022), true);
+    zoomSettle();
+  });
+}
+/* 滚轮停手 150 ms 后精绘一次：把 preview 期间被整体拉伸的字号/描边恢复成屏幕恒定值，
+   顺带重跑避让（缩放中标签是按旧比例避让的，可能挤在一起） */
+function zoomSettle() {
+  if (zSettle) clearTimeout(zSettle);
+  zSettle = setTimeout(() => {
+    zSettle = 0;
+    if (U.view === 'stations') drawStations();
+    else if (U.view === 'office' && U.officeMode === 'edit') drawEditor();
+  }, 150);
 }
 
 /* ---------- 历史 ---------- */
@@ -6191,30 +6259,37 @@ function bindStRows(host) {
   });
 }
 
+/* 网格只跟缩放比例和平移量走，和布局数据无关——单拎出来给平移复用（见 paintPan） */
+function paintGrid(grid) {
+  if (!grid) return;
+  const minor = .5 * U.k, major = 5 * U.k;
+  const showMinor = minor >= 7;
+  const layers = [];
+  if (showMinor) {
+    layers.push(`linear-gradient(to right, rgba(11,11,12,.05) 1px, transparent 1px)`);
+    layers.push(`linear-gradient(to bottom, rgba(11,11,12,.05) 1px, transparent 1px)`);
+  }
+  layers.push(`linear-gradient(to right, rgba(11,11,12,.10) 1px, transparent 1px)`);
+  layers.push(`linear-gradient(to bottom, rgba(11,11,12,.10) 1px, transparent 1px)`);
+  const sizes = [];
+  if (showMinor) sizes.push(`${minor}px ${minor}px`, `${minor}px ${minor}px`);
+  sizes.push(`${major}px ${major}px`, `${major}px ${major}px`);
+  grid.style.backgroundImage = layers.join(',');
+  grid.style.backgroundSize = sizes.join(',');
+  grid.style.backgroundPosition = sizes.map(() => `${U.px}px ${U.py}px`).join(',');
+}
+
 function drawStations() {
   const l = activeL(); const plan = activePlan(); if (!l || !plan) return;
   const cv = $('#stCv'); if (!cv) return;
-  const grid = $('#stGrid');
-  if (grid) {
-    const minor = .5 * U.k, major = 5 * U.k;
-    const showMinor = minor >= 7;
-    const layers = [];
-    if (showMinor) {
-      layers.push(`linear-gradient(to right, rgba(11,11,12,.05) 1px, transparent 1px)`);
-      layers.push(`linear-gradient(to bottom, rgba(11,11,12,.05) 1px, transparent 1px)`);
-    }
-    layers.push(`linear-gradient(to right, rgba(11,11,12,.10) 1px, transparent 1px)`);
-    layers.push(`linear-gradient(to bottom, rgba(11,11,12,.10) 1px, transparent 1px)`);
-    const sizes = [];
-    if (showMinor) sizes.push(`${minor}px ${minor}px`, `${minor}px ${minor}px`);
-    sizes.push(`${major}px ${major}px`, `${major}px ${major}px`);
-    grid.style.backgroundImage = layers.join(',');
-    grid.style.backgroundSize = sizes.join(',');
-    grid.style.backgroundPosition = sizes.map(() => `${U.px}px ${U.py}px`).join(',');
-  }
+  paintGrid($('#stGrid'));
   const svg = $('#stSvg');
   const mode = stationMode(U.k);
-  svg.innerHTML = `<g transform="translate(${U.px} ${U.py}) scale(${U.k})">
+  /* 悬停阴影的尺寸必须跟 k 走（阴影会被 svg 的 scale 一起放大，所以要 /k），
+     算好塞进 CSS 变量 —— 悬停是切类不重绘，走不了 inline style。颜色由标签自己的 --sc 提供 */
+  svg.style.setProperty('--sh-y', (ST_SH_Y / U.k).toFixed(4));
+  svg.style.setProperty('--sh-b', (ST_SH_B / U.k).toFixed(4));
+  svg.innerHTML = `<g data-vp="1" transform="translate(${U.px} ${U.py}) scale(${U.k})">
     <rect x="${4 / U.k}" y="${4 / U.k}" width="${l.w}" height="${l.h}" fill="rgba(11,11,12,.10)"/>
     <rect x="0" y="0" width="${l.w}" height="${l.h}" fill="#FFFFFF" stroke="rgba(11,11,12,.22)" stroke-width="${1.4 / U.k}"/>
     ${planGroup(l, U.k, { ref: true, chairs: false, plan })}
@@ -6231,6 +6306,18 @@ function drawStations() {
       <span class="muted">${assigned}/${plan.st.length} 已分配</span>`;
   }
   syncZoomLabel();
+}
+
+/* 平移只改变换：整张图都挂在外层 g[data-vp] 上，墙桌椅子标签一个都不用重建。
+   之前每帧 drawStations() 全量重建（150 工位约 11 ms），平移白吃掉半个帧预算。
+   ⚠️ 定位用它必须用 data 属性，**不能用 class**：样式表里 `.view{display:none}`
+   是页面容器的规则，给 <g> 挂 class="view" 会让整张画布直接消失（踩过）。 */
+function paintPan() {
+  const svg = $('#stSvg');
+  const g = svg && svg.querySelector('g[data-vp]');
+  if (!g) { drawStations(); return; }        /* 还没画过 / 结构刚变，回退整绘 */
+  g.setAttribute('transform', `translate(${U.px} ${U.py}) scale(${U.k})`);
+  paintGrid($('#stGrid'));
 }
 
 function scaleBar(l, mode) {
@@ -6302,7 +6389,7 @@ function stMove(e) {
     U.py = drag.py + (e.clientY - drag.sy);
     if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 2) drag.moved = true;
     if (rafId) return;
-    rafId = requestAnimationFrame(() => { rafId = null; drawStations(); positionPop(); });
+    rafId = requestAnimationFrame(() => { rafId = null; paintPan(); positionPop(); });
     return;
   }
   /* 悬停椅子：底色变亮 + 出分配信息。这里只切 class、不整图重绘——
@@ -6508,7 +6595,8 @@ function openStationPop(id, anchorRect) {
   };
   el.querySelector('#popSave').onclick = savePop;
   el._savePop = savePop;
-  if (anchorRect) setTimeout(() => codeInp.focus(), 40);
+  /* 打开就落在选人搜索框：这个浮窗最常干的事是换人，编号其次 */
+  if (anchorRect) setTimeout(() => q.focus(), 40);
 }
 
 function paintPopCur() {
@@ -7756,6 +7844,61 @@ function loadExample() {
   save(); commitSave('quiet');        /* 明确的创建动作，直接落盘，别让用户一打开就顶着「未保存」 */
   toast('示例已生成，可以直接改');
   openEditor(l.id);
+}
+
+/* ---------- 演示入口（?demo=1） ---------- */
+/* 参赛 / 评审用：库是空的时候自动装一套示例办公室 + 示例人员，直接进工位排座。
+   demo 模式把 OWNER 换成 'demo'，数据落在独立 key：用户浏览器里的真实库不进演示，演示也污染不到真实库。 */
+function demoOn() {
+  return new URLSearchParams(location.search).get('demo') === '1';
+}
+function seedDemo() {
+  if (D.layouts.length || D.staff.length) return false;
+  const l = exampleLayout();
+  D.layouts.push(l);
+
+  const depts = [['产品设计', '#4DE1FF'], ['研发中心', '#B9A2FF'], ['市场运营', '#FF9BC8'], ['职能支持', '#5BFFB0']]
+    .map(([name, color]) => ({ id: uid('d'), name, parentId: null, color }));
+  D.depts.push(...depts);
+
+  /* 姓名一律「姓＋某某」的脱敏写法：一眼看得出是示例，不会和真人重名。
+     姓池 158 个（百家姓前段），153 个工位刚好够用、不重名 */
+  const sur = '赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏章苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞万'.split('');
+  const titles = ['产品经理', '交互设计师', '前端工程师', '后端工程师', '测试工程师', '行政专员', 'HRBP', '财务', '市场运营', '项目经理'];
+  const n = l.chairs.length;
+  const per = Math.ceil(n / depts.length);
+  for (let i = 0; i < n; i++) {
+    D.staff.push({
+      id: uid('p'),
+      name: sur[i % sur.length] + '某某',
+      title: titles[i % titles.length],
+      /* 按人数四等分：椅子是挨着排的，这样同一部门正好坐成一片 */
+      deptId: depts[Math.min(depts.length - 1, (i / per) | 0)].id
+    });
+  }
+
+  const plan = normPlan({ name: '示例办公室', layoutId: l.id, st: [] }, D.layouts);
+  ensurePlan(plan, l);
+  /* 每把椅子都挂人并编号：演示要看的是「排满」的样子，不是空座位 */
+  plan.st.forEach((s, i) => { s.empId = D.staff[i].id; s.code = 'A' + String(i + 1).padStart(2, '0'); });
+  D.plans.push(plan);
+  D.activeLayout = l.id;
+  D.activePlan = plan.id;
+  save(); commitSave('quiet');
+  return true;
+}
+/* 演示视角：对准示例里那几排工位，缩到能看见「编号＋姓名」胶囊（60% 以上才出）。
+   中心点偏右半米：左边界落在 x≈17.5，正好避开最左那一列椅子向外伸出的胶囊，不会被切一半 */
+function demoView() {
+  const cv = $('#stCv');
+  if (!cv) return;
+  const r = cv.getBoundingClientRect();
+  if (!r.width) { requestAnimationFrame(demoView); return; }
+  U.k = K_BASE * .7;
+  U.px = r.width / 2 - 30.2 * U.k;
+  U.py = r.height / 2 - 11.5 * U.k;
+  drawStations();
+  syncZoomLabel();
 }
 
 /* ---------- 启动 ---------- */
